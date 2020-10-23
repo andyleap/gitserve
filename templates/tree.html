@@ -1,0 +1,21 @@
+<html>
+    <head>
+    </head>
+    <bo>
+        <table>
+            <tbody>
+                {{range .Dirs}}
+                <tr>
+                    <td>{{.Name}}</td>
+                </tr>
+                {{end}}
+                {{range .Files}}
+                <tr>
+                    <td>{{.Name}}</td>
+                </tr>
+                {{end}}
+
+            </tbody>
+        </table>
+    </bo>
+</html>

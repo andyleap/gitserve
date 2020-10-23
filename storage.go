@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"path"
 	"strings"
@@ -19,7 +20,7 @@ import (
 )
 
 type S3Storage struct {
-	s3   s3.Client
+	s3   *s3.Client
 	base string
 }
 
@@ -142,6 +143,9 @@ func (s *S3Storage) SetReference(r *plumbing.Reference) error {
 	hdrs := &http.Header{}
 	hdrs.Set("Content-Type", "application/x-git-"+r.Type().String())
 	err := s.s3.Put(s.RefPath(r.Name()), []byte(r.String()), hdrs)
+	if err != nil {
+		log.Println(err)
+	}
 	return err
 }
 
@@ -152,9 +156,11 @@ func (s *S3Storage) SetReference(r *plumbing.Reference) error {
 func (s *S3Storage) CheckAndSetReference(new *plumbing.Reference, old *plumbing.Reference) error {
 	oldref, err := s.Reference(old.Name())
 	if err != nil {
+		log.Println("check and set error", err)
 		return err
 	}
 	if oldref.String() != old.String() {
+		log.Println("check and set nomatch", oldref, old)
 		return fmt.Errorf("References don't match %q != %q", oldref.String(), old.String())
 	}
 	return s.SetReference(new)
@@ -163,15 +169,21 @@ func (s *S3Storage) CheckAndSetReference(new *plumbing.Reference, old *plumbing.
 func (s *S3Storage) Reference(rname plumbing.ReferenceName) (*plumbing.Reference, error) {
 	r, err := s.s3.Get(s.RefPath(rname))
 	if err != nil {
-		return nil, err
+		log.Println("reference error", err)
+		return nil, plumbing.ErrReferenceNotFound
 	}
 	buf, err := ioutil.ReadAll(r)
 	if err != nil {
+		log.Println("reference error", err)
 		return nil, err
 	}
 	parts := strings.Split(string(buf), " ")
-	ref := plumbing.NewReferenceFromStrings(parts[0], parts[1])
-	return ref, nil
+	if len(parts) == 2 {
+		return plumbing.NewReferenceFromStrings(parts[1], parts[0]), nil
+	} else if len(parts) == 3 {
+		return plumbing.NewReferenceFromStrings(parts[2], parts[0]+" "+parts[1]), nil
+	}
+	return nil, plumbing.ErrReferenceNotFound
 }
 
 type ReferenceIter struct {
@@ -193,8 +205,12 @@ func (ri *ReferenceIter) Next() (*plumbing.Reference, error) {
 		return nil, err
 	}
 	parts := strings.Split(string(buf), " ")
-	ref := plumbing.NewReferenceFromStrings(parts[0], parts[1])
-	return ref, nil
+	if len(parts) == 2 {
+		return plumbing.NewReferenceFromStrings(parts[1], parts[0]), nil
+	} else if len(parts) == 3 {
+		return plumbing.NewReferenceFromStrings(parts[2], parts[0]+" "+parts[1]), nil
+	}
+	return nil, plumbing.ErrReferenceNotFound
 }
 
 func (ri *ReferenceIter) ForEach(cb func(*plumbing.Reference) error) error {
