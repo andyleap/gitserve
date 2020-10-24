@@ -188,11 +188,15 @@ func main() {
 	if !ok {
 		log.Fatal("Could not find S3_SECRET, please assert it is set.")
 	}
+	bucket, ok := os.LookupEnv("S3_BUCKET")
+	if !ok {
+		log.Fatal("Could not find S3_BUCKET, please assert it is set.")
+	}
 	client, _ := s3.NewClient(&s3.Client{
 		AccessKeyID:     key,
 		SecretAccessKey: secret,
 		Domain:          "us-east-1.linodeobjects.com",
-		Bucket:          "andyleap-git",
+		Bucket:          bucket,
 		UsePathBuckets:  true,
 	})
 
@@ -237,6 +241,33 @@ func (gs *gitServe) index(rw http.ResponseWriter, req *http.Request) {
 	return
 }
 
+type RepoInfo struct {
+	Branches []string
+}
+
+type RequestInfo struct {
+	RepoRoot string
+	Dir      string
+	Ref      string
+	RepoInfo *RepoInfo
+}
+
+func (gs *gitServe) repoInfo(r *git.Repository) (*RepoInfo, error) {
+	biter, err := r.Branches()
+	if err != nil {
+		return nil, err
+	}
+	ri := &RepoInfo{}
+	err = biter.ForEach(func(p *plumbing.Reference) error {
+		ri.Branches = append(ri.Branches, p.Name().Short())
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return ri, nil
+}
+
 func (g *gitServe) git(rw http.ResponseWriter, req *http.Request) {
 
 	if req.URL.Path == "/" {
@@ -249,6 +280,7 @@ func (g *gitServe) git(rw http.ResponseWriter, req *http.Request) {
 	service := req.FormValue("service")
 	p := req.URL.Path
 	p = strings.TrimPrefix(p, "/")
+	p = strings.TrimSuffix(p, "/")
 	p = strings.TrimSuffix(p, "/info/refs")
 	if strings.HasSuffix(p, "/git-upload-pack") {
 		service = "git-upload-pack"
@@ -271,6 +303,7 @@ func (g *gitServe) git(rw http.ResponseWriter, req *http.Request) {
 				parts = []string{p, ""}
 				service = "web/blob"
 				if !ok {
+					log.Println(p)
 					http.Error(rw, "bad request", 400)
 					return
 				}
@@ -309,25 +342,45 @@ func (g *gitServe) git(rw http.ResponseWriter, req *http.Request) {
 			http.Error(rw, "unauthorized", 401)
 			return
 		}
-		refName := "HEAD"
+		refName := "master"
 		path := ""
 		if ep.Host != "" {
-			path = ep.Host
+			parts := strings.SplitN(ep.Host, "/", 2)
+			refName = parts[0]
+			if len(parts) == 2 {
+				path = parts[1]
+			}
 		}
 		r, err := git.Open(s.(storage.Storer), nil)
 		if err != nil {
+			log.Println(err)
 			http.Error(rw, "bad request", 400)
 			return
 		}
 
+		repoInfo, err := g.repoInfo(r)
+		if err != nil {
+			log.Println(err)
+			http.Error(rw, "bad request", 400)
+			return
+		}
+		ri := &RequestInfo{
+			RepoRoot: p,
+			Dir:      path,
+			Ref:      refName,
+			RepoInfo: repoInfo,
+		}
+
 		chash, err := r.ResolveRevision(plumbing.Revision(refName))
 		if err != nil {
+			log.Println(err)
 			http.Error(rw, "bad request", 400)
 			return
 		}
 
 		c, err := r.CommitObject(*chash)
 		if err != nil {
+			log.Println(err)
 			http.Error(rw, "bad request", 400)
 			return
 		}
@@ -339,17 +392,19 @@ func (g *gitServe) git(rw http.ResponseWriter, req *http.Request) {
 
 		tree, err := c.Tree()
 		if err != nil {
+			log.Println(err)
 			http.Error(rw, "bad request", 400)
 			return
 		}
 
 		if path == "" {
-			g.RenderTree(tree, rw, req)
+			g.RenderTree(tree, ri, rw, req)
 			return
 		}
 
 		e, err := tree.FindEntry(path)
 		if err != nil {
+			log.Println(err)
 			http.Error(rw, "bad request", 400)
 			return
 		}
@@ -357,6 +412,7 @@ func (g *gitServe) git(rw http.ResponseWriter, req *http.Request) {
 		if e.Mode.IsFile() {
 			b, err := r.BlobObject(e.Hash)
 			if err != nil {
+				log.Println(err)
 				http.Error(rw, "bad request", 400)
 				return
 			}
@@ -366,10 +422,11 @@ func (g *gitServe) git(rw http.ResponseWriter, req *http.Request) {
 
 		t, err := r.TreeObject(e.Hash)
 		if err != nil {
+			log.Println(err)
 			http.Error(rw, "bad request", 400)
 			return
 		}
-		g.RenderTree(t, rw, req)
+		g.RenderTree(t, ri, rw, req)
 
 	case "git-upload-pack":
 		ups, err := g.t.NewUploadPackSession(ep, nil)
@@ -461,11 +518,18 @@ type Entry struct {
 	Name string
 }
 
-func (gs *gitServe) RenderTree(t *object.Tree, rw http.ResponseWriter, req *http.Request) {
+func (gs *gitServe) RenderTree(t *object.Tree, ri *RequestInfo, rw http.ResponseWriter, req *http.Request) {
+	if ri.Dir != "" {
+		ri.Dir = strings.TrimSuffix(ri.Dir, "/") + "/"
+	}
 	treeData := struct {
+		RequestInfo *RequestInfo
+
 		Dirs  []Entry
 		Files []Entry
-	}{}
+	}{
+		RequestInfo: ri,
+	}
 
 	for _, entry := range t.Entries {
 		switch entry.Mode {
@@ -480,7 +544,10 @@ func (gs *gitServe) RenderTree(t *object.Tree, rw http.ResponseWriter, req *http
 		}
 	}
 
-	gs.tmpl.Render("tree.html", treeData, rw)
+	err := gs.tmpl.Render("tree.html", treeData, rw)
+	if err != nil {
+		log.Println(err)
+	}
 }
 
 func (gs *gitServe) RenderBlob(b *object.Blob, rw http.ResponseWriter, req *http.Request) {
@@ -490,5 +557,6 @@ func (gs *gitServe) RenderBlob(b *object.Blob, rw http.ResponseWriter, req *http
 		return
 	}
 	defer rc.Close()
+	rw.Header().Set("Content-Type", "text/plain")
 	io.Copy(rw, rc)
 }
